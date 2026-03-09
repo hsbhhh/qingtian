@@ -37,9 +37,9 @@ class Loss_fun(nn.Module):
 
     def supervised_contrastive_loss(self, proj_embeddings, pos_idx, neg_idx):
         """
-        proj_embeddings: dict of [N, D], each already normalized
-        pos_idx: strict positive indices in training set
-        neg_idx: strict negative indices in training set
+        proj_embeddings: dict, each tensor [N, D], already normalized
+        pos_idx: tensor of strict positive node indices in training set
+        neg_idx: tensor of strict negative node indices in training set
         """
         device = list(proj_embeddings.values())[0].device
         view_names = list(proj_embeddings.keys())
@@ -48,83 +48,71 @@ class Loss_fun(nn.Module):
         if len(pos_idx) == 0 or len(neg_idx) == 0:
             return torch.tensor(0.0, device=device)
 
-        labeled_idx = torch.cat([pos_idx, neg_idx], dim=0)
-        labels = torch.cat([
+        # 1) labeled nodes
+        labeled_idx = torch.cat([pos_idx, neg_idx], dim=0)   # [L]
+        node_labels = torch.cat([
             torch.ones(len(pos_idx), device=device),
             torch.zeros(len(neg_idx), device=device)
-        ], dim=0)
+        ], dim=0)  # [L]
 
-        # [L, V, D]
+        L = labeled_idx.size(0)
+
+        # 2) stack views: [L, V, D]
         z = torch.stack([proj_embeddings[v][labeled_idx] for v in view_names], dim=1)
 
-        total_loss = 0.0
-        valid_count = 0
+        # 3) flatten -> [L*V, D]
+        z_flat = z.reshape(L * num_views, -1)
 
-        L = z.size(0)
+        # 因为 projector 里已经 normalize 过，所以点积就是 cosine similarity
+        sim_matrix = torch.matmul(z_flat, z_flat.t()) / self.temperature   # [LV, LV]
 
-        for i in range(L):
-            anchor_label = labels[i]
+        # 数值稳定
+        sim_matrix = sim_matrix - sim_matrix.max(dim=1, keepdim=True)[0].detach()
+        exp_sim = torch.exp(sim_matrix)
 
-            for m in range(num_views):
-                anchor = z[i, m]  # [D]
+        # 4) 构造 node_id / view_id / class_label
+        node_ids = torch.arange(L, device=device).repeat_interleave(num_views)   # [LV]
+        view_ids = torch.arange(num_views, device=device).repeat(L)              # [LV]
+        flat_labels = node_labels.repeat_interleave(num_views)                   # [LV]
 
-                sim_all = []
-                pos_mask = []
-                neg_mask = []
+        # [LV, LV]
+        same_node = node_ids.unsqueeze(1) == node_ids.unsqueeze(0)
+        same_view = view_ids.unsqueeze(1) == view_ids.unsqueeze(0)
+        same_label = flat_labels.unsqueeze(1) == flat_labels.unsqueeze(0)
 
-                for j in range(L):
-                    for n in range(num_views):
-                        # 排除自身同视图
-                        if i == j and m == n:
-                            continue
+        # 排除自己
+        self_mask = torch.eye(L * num_views, dtype=torch.bool, device=device)
 
-                        sim = F.cosine_similarity(
-                            anchor.unsqueeze(0),
-                            z[j, n].unsqueeze(0),
-                            dim=1
-                        )[0] / self.temperature
+        # 正样本：
+        # 1) 同一个节点不同视图
+        # 2) 不同节点但同标签
+        pos_mask = ((same_node & (~same_view)) | ((~same_node) & same_label)) & (~self_mask)
 
-                        sim_all.append(sim)
+        # 负样本：不同节点且异标签
+        neg_mask = ((~same_node) & (~same_label)) & (~self_mask)
 
-                        same_label = (labels[j] == anchor_label)
-                        same_node_other_view = (i == j and m != n)
+        # 分母只包含正样本和负样本
+        denom_mask = pos_mask | neg_mask
 
-                        if same_node_other_view or (same_label and i != j):
-                            pos_mask.append(True)
-                            neg_mask.append(False)
-                        elif labels[j] != anchor_label:
-                            pos_mask.append(False)
-                            neg_mask.append(True)
-                        else:
-                            pos_mask.append(False)
-                            neg_mask.append(False)
+        # 5) 计算 loss
+        denom = (exp_sim * denom_mask.float()).sum(dim=1) + 1e-12    # [LV]
+        pos_exp = exp_sim * pos_mask.float()                         # [LV, LV]
 
-                if len(sim_all) == 0:
-                    continue
+        # 每个 anchor 的正样本个数
+        pos_count = pos_mask.sum(dim=1)   # [LV]
 
-                sim_all = torch.stack(sim_all)  # [K]
-                exp_sim = torch.exp(sim_all)
+        valid_anchor = (pos_count > 0) & (denom_mask.sum(dim=1) > 0)
 
-                pos_mask = torch.tensor(pos_mask, dtype=torch.bool, device=device)
-                neg_mask = torch.tensor(neg_mask, dtype=torch.bool, device=device)
-
-                denom_mask = pos_mask | neg_mask
-
-                if pos_mask.sum() == 0 or denom_mask.sum() == 0:
-                    continue
-
-                denom = exp_sim[denom_mask].sum() + 1e-12
-                pos_vals = exp_sim[pos_mask]
-
-                loss_i = -torch.log(pos_vals / denom).mean()
-                total_loss += loss_i
-                valid_count += 1
-
-        if valid_count == 0:
+        if valid_anchor.sum() == 0:
             return torch.tensor(0.0, device=device)
 
-        return total_loss / valid_count
+        # 对每个 anchor，把所有正样本的 -log(exp(sim_pos)/denom) 取平均
+        log_prob = -torch.log((pos_exp + 1e-12) / denom.unsqueeze(1))
+        loss_per_anchor = (log_prob * pos_mask.float()).sum(dim=1) / (pos_count.float() + 1e-12)
 
+        loss = loss_per_anchor[valid_anchor].mean()
+        return loss
+    
     def unsupervised_consistency_loss(self, proj_embeddings, unlabeled_idx):
         """
         仅对无标签节点做“同一基因跨视图一致性”
