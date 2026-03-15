@@ -1,224 +1,150 @@
+# loss.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class Loss_fun(nn.Module):
+class DriverGeneLoss(nn.Module):
     def __init__(
         self,
-        temperature=0.2,
-        lambda_main=1.0,
-        lambda_view=1.0,
-        lambda_sup=1.0,
-        lambda_unsup=0.2,
-        max_unsup_samples=2048
+        cls_pos_weight=8.0,
+        lambda_cls=1.0,
+        lambda_proto=0.3,
+        lambda_hard_neg=0.4,
+        lambda_align=0.15,
+        lambda_mixup=0.15,
+        proto_margin=1.0,
+        hard_neg_margin=0.5
     ):
         super().__init__()
-        self.temperature = temperature
-        self.lambda_main = lambda_main
-        self.lambda_view = lambda_view
-        self.lambda_sup = lambda_sup
-        self.lambda_unsup = lambda_unsup
-        self.max_unsup_samples = max_unsup_samples
+        self.cls_pos_weight = cls_pos_weight
 
-    def masked_bce_loss(self, logits, labels, mask, pos_weight=None):
-        if mask.sum() == 0:
-            return torch.tensor(0.0, device=logits.device)
+        self.lambda_cls = lambda_cls
+        self.lambda_proto = lambda_proto
+        self.lambda_hard_neg = lambda_hard_neg
+        self.lambda_align = lambda_align
+        self.lambda_mixup = lambda_mixup
 
-        logits_m = logits[mask]
-        labels_m = labels[mask]
+        self.proto_margin = proto_margin
+        self.hard_neg_margin = hard_neg_margin
 
-        if pos_weight is not None:
-            loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-        else:
-            loss_fn = nn.BCEWithLogitsLoss()
+    def classification_loss(self, logits, y, supervised_mask, sample_weight=None):
+        if supervised_mask.sum() == 0:
+            return logits.new_tensor(0.0)
 
-        return loss_fn(logits_m, labels_m)
+        logits_sup = logits[supervised_mask]
+        y_sup = y[supervised_mask].float()
 
-    def supervised_contrastive_loss(self, proj_embeddings, pos_idx, neg_idx):
+        pos_weight = torch.tensor(self.cls_pos_weight, dtype=logits.dtype, device=logits.device)
+        loss_vec = F.binary_cross_entropy_with_logits(
+            logits_sup, y_sup, pos_weight=pos_weight, reduction='none'
+        )
+
+        if sample_weight is not None:
+            w = sample_weight[supervised_mask].float()
+            loss_vec = loss_vec * w
+
+        return loss_vec.mean()
+
+    def prototype_margin_loss(self, z, y, supervised_mask, p_pos, p_neg):
+        if supervised_mask.sum() == 0:
+            return z.new_tensor(0.0)
+
+        z_sup = z[supervised_mask]
+        y_sup = y[supervised_mask].float()
+
+        d_pos = torch.sum((z_sup - p_pos.unsqueeze(0)) ** 2, dim=1)
+        d_neg = torch.sum((z_sup - p_neg.unsqueeze(0)) ** 2, dim=1)
+
+        pos_mask = (y_sup == 1)
+        neg_mask = (y_sup == 0)
+
+        loss_pos = z.new_tensor(0.0)
+        loss_neg = z.new_tensor(0.0)
+
+        if pos_mask.sum() > 0:
+            loss_pos = F.relu(self.proto_margin + d_pos[pos_mask] - d_neg[pos_mask]).mean()
+        if neg_mask.sum() > 0:
+            loss_neg = F.relu(self.proto_margin + d_neg[neg_mask] - d_pos[neg_mask]).mean()
+
+        return loss_pos + loss_neg
+
+    def hard_negative_loss(self, logits, hard_neg_idx):
+        if hard_neg_idx is None or len(hard_neg_idx) == 0:
+            return logits.new_tensor(0.0)
+
+        hard_logits = logits[hard_neg_idx]
+        # 希望 hard negatives 更偏向负类
+        return F.relu(self.hard_neg_margin + hard_logits).mean()
+
+    def graph_structure_alignment_loss(self, view_embeddings, sampled_idx):
         """
-        proj_embeddings: dict, each tensor [N, D], already normalized
-        pos_idx: tensor of strict positive node indices in training set
-        neg_idx: tensor of strict negative node indices in training set
+        对齐视图间关系图，而不是直接对齐 embedding
         """
-        device = list(proj_embeddings.values())[0].device
-        view_names = list(proj_embeddings.keys())
-        num_views = len(view_names)
+        if sampled_idx is None or len(sampled_idx) < 2:
+            return next(iter(view_embeddings.values())).new_tensor(0.0)
 
-        if len(pos_idx) == 0 or len(neg_idx) == 0:
-            return torch.tensor(0.0, device=device)
+        keys = list(view_embeddings.keys())
+        loss = 0.0
+        cnt = 0
 
-        # 1) labeled nodes
-        labeled_idx = torch.cat([pos_idx, neg_idx], dim=0)   # [L]
-        node_labels = torch.cat([
-            torch.ones(len(pos_idx), device=device),
-            torch.zeros(len(neg_idx), device=device)
-        ], dim=0)  # [L]
+        sims = {}
+        for k in keys:
+            z = view_embeddings[k][sampled_idx]
+            z = F.normalize(z, p=2, dim=1)
+            s = torch.matmul(z, z.t())        # [B,B]
+            s = F.softmax(s, dim=1)
+            sims[k] = s
 
-        L = labeled_idx.size(0)
+        for i in range(len(keys)):
+            for j in range(i + 1, len(keys)):
+                loss = loss + F.mse_loss(sims[keys[i]], sims[keys[j]])
+                cnt += 1
 
-        # 2) stack views: [L, V, D]
-        z = torch.stack([proj_embeddings[v][labeled_idx] for v in view_names], dim=1)
+        return loss / max(cnt, 1)
 
-        # 3) flatten -> [L*V, D]
-        z_flat = z.reshape(L * num_views, -1)
-
-        # 因为 projector 里已经 normalize 过，所以点积就是 cosine similarity
-        sim_matrix = torch.matmul(z_flat, z_flat.t()) / self.temperature   # [LV, LV]
-
-        # 数值稳定
-        sim_matrix = sim_matrix - sim_matrix.max(dim=1, keepdim=True)[0].detach()
-        exp_sim = torch.exp(sim_matrix)
-
-        # 4) 构造 node_id / view_id / class_label
-        node_ids = torch.arange(L, device=device).repeat_interleave(num_views)   # [LV]
-        view_ids = torch.arange(num_views, device=device).repeat(L)              # [LV]
-        flat_labels = node_labels.repeat_interleave(num_views)                   # [LV]
-
-        # [LV, LV]
-        same_node = node_ids.unsqueeze(1) == node_ids.unsqueeze(0)
-        same_view = view_ids.unsqueeze(1) == view_ids.unsqueeze(0)
-        same_label = flat_labels.unsqueeze(1) == flat_labels.unsqueeze(0)
-
-        # 排除自己
-        self_mask = torch.eye(L * num_views, dtype=torch.bool, device=device)
-
-        # 正样本：
-        # 1) 同一个节点不同视图
-        # 2) 不同节点但同标签
-        pos_mask = ((same_node & (~same_view)) | ((~same_node) & same_label)) & (~self_mask)
-
-        # 负样本：不同节点且异标签
-        neg_mask = ((~same_node) & (~same_label)) & (~self_mask)
-
-        # 分母只包含正样本和负样本
-        denom_mask = pos_mask | neg_mask
-
-        # 5) 计算 loss
-        denom = (exp_sim * denom_mask.float()).sum(dim=1) + 1e-12    # [LV]
-        pos_exp = exp_sim * pos_mask.float()                         # [LV, LV]
-
-        # 每个 anchor 的正样本个数
-        pos_count = pos_mask.sum(dim=1)   # [LV]
-
-        valid_anchor = (pos_count > 0) & (denom_mask.sum(dim=1) > 0)
-
-        if valid_anchor.sum() == 0:
-            return torch.tensor(0.0, device=device)
-
-        # 对每个 anchor，把所有正样本的 -log(exp(sim_pos)/denom) 取平均
-        log_prob = -torch.log((pos_exp + 1e-12) / denom.unsqueeze(1))
-        loss_per_anchor = (log_prob * pos_mask.float()).sum(dim=1) / (pos_count.float() + 1e-12)
-
-        loss = loss_per_anchor[valid_anchor].mean()
-        return loss
-    
-    def unsupervised_consistency_loss(self, proj_embeddings, unlabeled_idx):
-        """
-        仅对无标签节点做“同一基因跨视图一致性”
-        """
-        device = list(proj_embeddings.values())[0].device
-        view_names = list(proj_embeddings.keys())
-        num_views = len(view_names)
-
-        if len(unlabeled_idx) == 0:
-            return torch.tensor(0.0, device=device)
-
-        if len(unlabeled_idx) > self.max_unsup_samples:
-            rand_perm = torch.randperm(len(unlabeled_idx), device=device)
-            unlabeled_idx = unlabeled_idx[rand_perm[:self.max_unsup_samples]]
-
-        # [U, V, D]
-        z = torch.stack([proj_embeddings[v][unlabeled_idx] for v in view_names], dim=1)
-        U = z.size(0)
-
-        all_z = z.reshape(U * num_views, -1)  # [U*V, D]
-
-        total_loss = 0.0
-        valid_count = 0
-
-        for i in range(U):
-            for m in range(num_views):
-                anchor = z[i, m]
-
-                sim_all = F.cosine_similarity(
-                    anchor.unsqueeze(0), all_z, dim=1
-                ) / self.temperature
-                exp_sim = torch.exp(sim_all)
-
-                # self index in flattened all_z
-                self_flat_idx = i * num_views + m
-
-                # positive: same node, other views
-                pos_indices = [
-                    i * num_views + n for n in range(num_views) if n != m
-                ]
-
-                denom_mask = torch.ones(U * num_views, dtype=torch.bool, device=device)
-                denom_mask[self_flat_idx] = False
-
-                pos_mask = torch.zeros(U * num_views, dtype=torch.bool, device=device)
-                pos_mask[pos_indices] = True
-
-                denom = exp_sim[denom_mask].sum() + 1e-12
-                pos_vals = exp_sim[pos_mask]
-
-                if len(pos_vals) == 0:
-                    continue
-
-                loss_i = -torch.log(pos_vals / denom).mean()
-                total_loss += loss_i
-                valid_count += 1
-
-        if valid_count == 0:
-            return torch.tensor(0.0, device=device)
-
-        return total_loss / valid_count
+    def positive_mixup_loss(self, mixed_logits):
+        if mixed_logits is None or mixed_logits.numel() == 0:
+            return mixed_logits.new_tensor(0.0) if mixed_logits is not None else torch.tensor(0.0)
+        target = torch.ones_like(mixed_logits)
+        return F.binary_cross_entropy_with_logits(mixed_logits, target)
 
     def forward(
         self,
-        outputs,
-        labels,
-        train_mask,
-        train_pos_idx,
-        train_neg_idx,
-        unlabeled_idx,
-        pos_weight=None
+        output_dict,
+        y,
+        supervised_mask,
+        hard_neg_idx=None,
+        align_sample_idx=None,
+        sample_weight=None,
+        mixed_logits=None
     ):
-        fused_logit = outputs["fused_logit"]
-        view_logits = outputs["view_logits"]
-        proj_embeddings = outputs["proj_embeddings"]
+        logits = output_dict['logits']
+        z = output_dict['embedding']
+        p_pos = output_dict['p_pos']
+        p_neg = output_dict['p_neg']
+        view_embeddings = output_dict['view_embeddings']
 
-        main_loss = self.masked_bce_loss(
-            fused_logit, labels, train_mask, pos_weight=pos_weight
+        loss_cls = self.classification_loss(logits, y, supervised_mask, sample_weight=sample_weight)
+        loss_proto = self.prototype_margin_loss(z, y, supervised_mask, p_pos, p_neg)
+        loss_hard_neg = self.hard_negative_loss(logits, hard_neg_idx)
+        loss_align = self.graph_structure_alignment_loss(view_embeddings, align_sample_idx)
+        loss_mixup = self.positive_mixup_loss(mixed_logits)
+
+        total = (
+            self.lambda_cls * loss_cls
+            + self.lambda_proto * loss_proto
+            + self.lambda_hard_neg * loss_hard_neg
+            + self.lambda_align * loss_align
+            + self.lambda_mixup * loss_mixup
         )
 
-        view_loss = 0.0
-        for _, logit in view_logits.items():
-            view_loss += self.masked_bce_loss(
-                logit, labels, train_mask, pos_weight=pos_weight
-            )
-        view_loss = view_loss / len(view_logits)
-
-        sup_cl_loss = self.supervised_contrastive_loss(
-            proj_embeddings, train_pos_idx, train_neg_idx
-        )
-
-        unsup_cl_loss = self.unsupervised_consistency_loss(
-            proj_embeddings, unlabeled_idx
-        )
-
-        total_loss = (
-            self.lambda_main * main_loss +
-            self.lambda_view * view_loss +
-            self.lambda_sup * sup_cl_loss +
-            self.lambda_unsup * unsup_cl_loss
-        )
-
-        return {
-            "total_loss": total_loss,
-            "main_loss": main_loss,
-            "view_loss": view_loss,
-            "sup_cl_loss": sup_cl_loss,
-            "unsup_cl_loss": unsup_cl_loss
+        loss_dict = {
+            'total': total.detach(),
+            'cls': loss_cls.detach(),
+            'proto': loss_proto.detach(),
+            'hard_neg': loss_hard_neg.detach(),
+            'align': loss_align.detach(),
+            'mixup': loss_mixup.detach(),
         }
+        return total, loss_dict

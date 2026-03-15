@@ -1,190 +1,299 @@
+# model.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-def build_sparse_adj(row, col, score, num_nodes, device, add_self_loop=True):
-    row = row.to(device)
-    col = col.to(device)
-    score = score.to(device).float()
-
-    if add_self_loop:
-        self_loop = torch.arange(num_nodes, device=device)
-        row = torch.cat([row, self_loop], dim=0)
-        col = torch.cat([col, self_loop], dim=0)
-        score = torch.cat([score, torch.ones(num_nodes, device=device)], dim=0)
-
-    indices = torch.stack([row, col], dim=0)
-    adj = torch.sparse_coo_tensor(indices, score, (num_nodes, num_nodes), device=device)
-    adj = adj.coalesce()
-
-    # D^{-1/2} A D^{-1/2}
-    deg = torch.sparse.sum(adj, dim=1).to_dense()
-    deg_inv_sqrt = torch.pow(deg.clamp(min=1e-12), -0.5)
-
-    row_idx, col_idx = adj.indices()
-    val = adj.values() * deg_inv_sqrt[row_idx] * deg_inv_sqrt[col_idx]
-
-    norm_adj = torch.sparse_coo_tensor(
-        adj.indices(), val, adj.shape, device=device
-    ).coalesce()
-
-    return norm_adj
+def add_self_loops(edge_index, edge_weight, num_nodes, fill_value=1.0):
+    device = edge_index.device
+    loop = torch.arange(num_nodes, device=device)
+    loop_index = torch.stack([loop, loop], dim=0)
+    loop_weight = torch.full((num_nodes,), fill_value, dtype=edge_weight.dtype, device=device)
+    edge_index = torch.cat([edge_index, loop_index], dim=1)
+    edge_weight = torch.cat([edge_weight, loop_weight], dim=0)
+    return edge_index, edge_weight
 
 
-class GraphConvolution(nn.Module):
+def normalize_edge_index(edge_index, edge_weight, num_nodes):
+    row, col = edge_index[0], edge_index[1]
+    deg = torch.zeros(num_nodes, device=edge_weight.device, dtype=edge_weight.dtype)
+    deg.scatter_add_(0, row, edge_weight)
+    deg_inv_sqrt = deg.clamp(min=1e-12).pow(-0.5)
+    norm_weight = deg_inv_sqrt[row] * edge_weight * deg_inv_sqrt[col]
+    return norm_weight
+
+
+class SparseGCNLayer(nn.Module):
     def __init__(self, in_dim, out_dim, bias=True):
         super().__init__()
         self.linear = nn.Linear(in_dim, out_dim, bias=bias)
 
-    def forward(self, x, adj):
-        x = self.linear(x)
-        x = torch.sparse.mm(adj, x)
-        return x
+    def forward(self, x, edge_index, edge_weight, num_nodes):
+        edge_index, edge_weight = add_self_loops(edge_index, edge_weight, num_nodes, fill_value=1.0)
+        norm_weight = normalize_edge_index(edge_index, edge_weight, num_nodes)
+
+        h = self.linear(x)
+        row, col = edge_index[0], edge_index[1]
+
+        out = torch.zeros_like(h)
+        out.index_add_(0, row, h[col] * norm_weight.unsqueeze(-1))
+        return out
 
 
-class ViewGCNEncoder(nn.Module):
-    def __init__(self, in_dim, hidden_dim1,hidden_dim2, out_dim, dropout=0.2, negative_slope=0.2):
+class GCNEncoder(nn.Module):
+    """
+    每层都注入位置编码（结构先验），而不是只在输入层加一次
+    """
+    def __init__(self, in_dim, pos_dim, hidden_dim, out_dim, num_layers=2, dropout=0.2, pos_hidden_dim=16):
         super().__init__()
-        self.gc1 = GraphConvolution(in_dim, hidden_dim1)
-        self.gc2 = GraphConvolution(hidden_dim1,hidden_dim2)
-        self.gc3 = GraphConvolution(hidden_dim2, out_dim)
-
+        assert num_layers >= 1
+        self.num_layers = num_layers
         self.dropout = dropout
-        self.negative_slope = negative_slope
 
-    def forward(self, x, adj):
-        h = self.gc1(x, adj)
-        h = F.leaky_relu(h, negative_slope=self.negative_slope)
-        h = F.dropout(h, p=self.dropout, training=self.training)
+        self.pos_proj = nn.ModuleList()
+        self.layers = nn.ModuleList()
+        self.norms = nn.ModuleList()
 
-        h = self.gc2(h, adj)
-        h = F.leaky_relu(h, negative_slope=self.negative_slope)
-        h = F.dropout(h, p=self.dropout, training=self.training)
+        current_dim = in_dim
+        for layer_id in range(num_layers):
+            self.pos_proj.append(
+                nn.Sequential(
+                    nn.Linear(pos_dim, pos_hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(pos_hidden_dim, pos_hidden_dim)
+                )
+            )
+            next_dim = out_dim if layer_id == num_layers - 1 else hidden_dim
+            self.layers.append(SparseGCNLayer(current_dim + pos_hidden_dim, next_dim))
+            if layer_id != num_layers - 1:
+                self.norms.append(nn.LayerNorm(next_dim))
+            current_dim = next_dim
 
-        z = self.gc3(h, adj)
-        return z
+    def forward(self, x, pos_feat, edge_index, edge_weight):
+        h = x
+        num_nodes = h.size(0)
+        for i, layer in enumerate(self.layers):
+            pe = self.pos_proj[i](pos_feat)
+            h = torch.cat([h, pe], dim=1)
+            h = layer(h, edge_index, edge_weight, num_nodes)
+            if i < len(self.layers) - 1:
+                h = self.norms[i](h)
+                h = F.relu(h)
+                h = F.dropout(h, p=self.dropout, training=self.training)
+        return h
 
 
-class MLPClassifier(nn.Module):
-    def __init__(self, in_dim, hidden_dim=None):
+class ViewFusionGate(nn.Module):
+    """
+    每个视图独立 gate，而不是共享一个 gate MLP
+    """
+    def __init__(self, view_names, in_dim, gate_hidden_dim=64):
         super().__init__()
-        if hidden_dim is None:
-            hidden_dim = max(in_dim // 2, 16)
+        self.view_names = view_names
+        self.gates = nn.ModuleDict({
+            v: nn.Sequential(
+                nn.Linear(in_dim, gate_hidden_dim),
+                nn.ReLU(),
+                nn.Linear(gate_hidden_dim, 1)
+            )
+            for v in view_names
+        })
 
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
+    def forward(self, view_embeddings):
+        # view_embeddings: dict {view_name: [N, D]}
+        scores = []
+        embeds = []
+        for v in self.view_names:
+            z = view_embeddings[v]
+            scores.append(self.gates[v](z))   # [N,1]
+            embeds.append(z)
+        scores = torch.cat(scores, dim=1)     # [N,V]
+        alpha = F.softmax(scores, dim=1)
+
+        stacked = torch.stack(embeds, dim=1)  # [N,V,D]
+        fused = torch.sum(alpha.unsqueeze(-1) * stacked, dim=1)
+        return fused, alpha
+
+
+class PrototypeHead(nn.Module):
+    """
+    用距离粗中心最近的 top-k 样本计算原型
+    """
+    def __init__(self, embed_dim, hidden_dim=128, proto_alpha=0.25, proto_topk_ratio=0.6, min_proto_k=8):
+        super().__init__()
+        self.proto_alpha = proto_alpha
+        self.proto_topk_ratio = proto_topk_ratio
+        self.min_proto_k = min_proto_k
+
+        self.cls_head = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(hidden_dim, 1)
         )
 
-    def forward(self, x):
-        return self.net(x).squeeze(-1)  # [N]
+    def _topk_center_proto(self, z_sub):
+        if z_sub.size(0) == 0:
+            return torch.zeros(z_sub.size(1), device=z_sub.device)
+
+        center = z_sub.mean(dim=0, keepdim=True)
+        dist = torch.sum((z_sub - center) ** 2, dim=1)
+        k = max(self.min_proto_k, int(z_sub.size(0) * self.proto_topk_ratio))
+        k = min(k, z_sub.size(0))
+        topk_idx = torch.topk(dist, k=k, largest=False).indices
+        proto = z_sub[topk_idx].mean(dim=0)
+        return proto
+
+    def compute_prototypes(self, z, pos_idx, neg_idx):
+        if len(pos_idx) == 0:
+            p_pos = torch.zeros(z.size(1), device=z.device)
+        else:
+            p_pos = self._topk_center_proto(z[pos_idx])
+
+        if len(neg_idx) == 0:
+            p_neg = torch.zeros(z.size(1), device=z.device)
+        else:
+            p_neg = self._topk_center_proto(z[neg_idx])
+
+        return p_pos, p_neg
+
+    def classify_with_prototypes(self, z, p_pos, p_neg):
+        logits_mlp = self.cls_head(z).squeeze(-1)
+
+        d_pos = torch.sum((z - p_pos.unsqueeze(0)) ** 2, dim=1)
+        d_neg = torch.sum((z - p_neg.unsqueeze(0)) ** 2, dim=1)
+
+        proto_logit = (d_neg - d_pos) / (z.size(1) ** 0.5)
+        logits = logits_mlp + self.proto_alpha * proto_logit
+        return logits, logits_mlp, proto_logit
+
+    def forward(self, z, pos_idx, neg_idx):
+        p_pos, p_neg = self.compute_prototypes(z, pos_idx, neg_idx)
+        logits, logits_mlp, proto_logit = self.classify_with_prototypes(z, p_pos, p_neg)
+
+        return {
+            'logits': logits,
+            'logits_mlp': logits_mlp,
+            'proto_logit': proto_logit,
+            'p_pos': p_pos,
+            'p_neg': p_neg
+        }
 
 
-class ProjectionHead(nn.Module):
-    def __init__(self, in_dim, proj_dim=None):
-        super().__init__()
-        if proj_dim is None:
-            proj_dim = in_dim
-
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, in_dim),
-            nn.ReLU(),
-            nn.Linear(in_dim, proj_dim)
-        )
-
-    def forward(self, x):
-        z = self.net(x)
-        z = F.normalize(z, p=2, dim=-1)
-        return z
-
-
-class MultiViewContrastiveModel(nn.Module):
+class DriverGeneFewShotModel(nn.Module):
     def __init__(
         self,
-        input_dim,
-        hidden_dim1,
-        hidden_dim2,
-        embed_dim,
-        view_names=("ppi", "path", "go"),
-        dropout=0.2
+        in_dim,
+        pos_dim,
+        hidden_dim=128,
+        embed_dim=128,
+        num_layers=2,
+        dropout=0.2,
+        view_names=('ppi', 'path', 'go'),
+        proto_alpha=0.25,
+        proto_topk_ratio=0.6,
+        min_proto_k=8
     ):
         super().__init__()
         self.view_names = list(view_names)
-        self.num_views = len(self.view_names)
 
-        self.encoders = nn.ModuleDict({
-            view: ViewGCNEncoder(input_dim, hidden_dim1, hidden_dim2,embed_dim, dropout)
-            for view in self.view_names
-        })
-
-        self.view_classifiers = nn.ModuleDict({
-            view: MLPClassifier(embed_dim)
-            for view in self.view_names
-        })
-
-        self.projectors = nn.ModuleDict({
-            view: ProjectionHead(embed_dim, embed_dim)
-            for view in self.view_names
-        })
-
-        # 注意力融合：输入是拼接后的所有视图表示
-        self.att_mlp = nn.Sequential(
-            nn.Linear(self.num_views * embed_dim, embed_dim),
+        self.input_proj = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(embed_dim, self.num_views)
+            nn.Dropout(dropout)
         )
 
-        self.fusion_classifier = MLPClassifier(embed_dim)
+        self.spec_encoders = nn.ModuleDict({
+            v: GCNEncoder(
+                in_dim=hidden_dim,
+                pos_dim=pos_dim,
+                hidden_dim=hidden_dim,
+                out_dim=embed_dim // 2,
+                num_layers=num_layers,
+                dropout=dropout
+            ) for v in self.view_names
+        })
 
-    def forward(self, node_features, edge_indices_with_score):
-        device = node_features.device
-        num_nodes = node_features.size(0)
+        self.cons_encoder = GCNEncoder(
+            in_dim=hidden_dim,
+            pos_dim=pos_dim,
+            hidden_dim=hidden_dim,
+            out_dim=embed_dim // 2,
+            num_layers=num_layers,
+            dropout=dropout
+        )
+
+        self.post_view_proj = nn.ModuleDict({
+            v: nn.Sequential(
+                nn.Linear(embed_dim, embed_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            ) for v in self.view_names
+        })
+
+        self.fusion_gate = ViewFusionGate(
+            view_names=self.view_names,
+            in_dim=embed_dim,
+            gate_hidden_dim=hidden_dim // 2
+        )
+
+        self.fusion_proj = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.LayerNorm(embed_dim)
+        )
+
+        self.proto_head = PrototypeHead(
+            embed_dim=embed_dim,
+            hidden_dim=hidden_dim,
+            proto_alpha=proto_alpha,
+            proto_topk_ratio=proto_topk_ratio,
+            min_proto_k=min_proto_k
+        )
+
+    def encode_one_view(self, x0, pos_feat, edge_index, edge_weight, view_name):
+        z_spec = self.spec_encoders[view_name](x0, pos_feat, edge_index, edge_weight)
+        z_cons = self.cons_encoder(x0, pos_feat, edge_index, edge_weight)
+        z = torch.cat([z_spec, z_cons], dim=1)
+        z = self.post_view_proj[view_name](z)
+        return z, z_spec, z_cons
+
+    def forward(self, x, pos_feat, edge_index_dict, edge_weight_dict, pos_idx, neg_idx):
+        x0 = self.input_proj(x)
 
         view_embeddings = {}
-        view_logits = {}
-        proj_embeddings = {}
+        spec_embeddings = {}
+        cons_embeddings = {}
 
-        for view in self.view_names:
-            row, col, score = edge_indices_with_score[view]
-            adj = build_sparse_adj(row, col, score, num_nodes, device)
+        for v in self.view_names:
+            z_v, z_spec, z_cons = self.encode_one_view(
+                x0, pos_feat, edge_index_dict[v], edge_weight_dict[v], v
+            )
+            view_embeddings[v] = z_v
+            spec_embeddings[v] = z_spec
+            cons_embeddings[v] = z_cons
 
-            z = self.encoders[view](node_features, adj)     # [N, D]
-            logit = self.view_classifiers[view](z)          # [N]
-            proj = self.projectors[view](z)                 # [N, D]
+        fused_z, gate_weights = self.fusion_gate(view_embeddings)
+        fused_z = self.fusion_proj(fused_z)
 
-            view_embeddings[view] = z
-            view_logits[view] = logit
-            proj_embeddings[view] = proj
+        proto_out = self.proto_head(fused_z, pos_idx=pos_idx, neg_idx=neg_idx)
 
-        # [N, V, D]
-        stacked_views = torch.stack(
-            [view_embeddings[v] for v in self.view_names], dim=1
-        )
-
-        # [N, V*D]
-        concat_views = torch.cat(
-            [view_embeddings[v] for v in self.view_names], dim=-1
-        )
-
-        # [N, V]
-        att_logits = self.att_mlp(concat_views)
-        att_weights = F.softmax(att_logits, dim=-1)
-
-        # 加权融合 [N, D]
-        fused_embedding = torch.sum(
-            stacked_views * att_weights.unsqueeze(-1), dim=1
-        )
-
-        fused_logit = self.fusion_classifier(fused_embedding)  # [N]
-
-        return {
-            "view_embeddings": view_embeddings,
-            "proj_embeddings": proj_embeddings,
-            "view_logits": view_logits,
-            "fused_embedding": fused_embedding,
-            "fused_logit": fused_logit,
-            "att_weights": att_weights
+        out = {
+            'embedding': fused_z,
+            'prob': torch.sigmoid(proto_out['logits']),
+            'gate_weights': gate_weights,
+            'view_embeddings': view_embeddings,
+            'spec_embeddings': spec_embeddings,
+            'cons_embeddings': cons_embeddings,
+            'logits': proto_out['logits'],
+            'logits_mlp': proto_out['logits_mlp'],
+            'proto_logit': proto_out['proto_logit'],
+            'p_pos': proto_out['p_pos'],
+            'p_neg': proto_out['p_neg'],
         }
+        return out
+
+    def classify_embeddings(self, z, p_pos, p_neg):
+        logits, logits_mlp, proto_logit = self.proto_head.classify_with_prototypes(z, p_pos, p_neg)
+        return logits, logits_mlp, proto_logit
