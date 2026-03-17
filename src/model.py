@@ -41,9 +41,6 @@ class SparseGCNLayer(nn.Module):
 
 
 class GCNEncoder(nn.Module):
-    """
-    每层都注入位置编码（结构先验），而不是只在输入层加一次
-    """
     def __init__(self, in_dim, pos_dim, hidden_dim, out_dim, num_layers=2, dropout=0.2, pos_hidden_dim=16):
         super().__init__()
         assert num_layers >= 1
@@ -84,9 +81,7 @@ class GCNEncoder(nn.Module):
 
 
 class ViewFusionGate(nn.Module):
-    """
-    每个视图独立 gate，而不是共享一个 gate MLP
-    """
+
     def __init__(self, view_names, in_dim, gate_hidden_dim=64):
         super().__init__()
         self.view_names = view_names
@@ -100,7 +95,6 @@ class ViewFusionGate(nn.Module):
         })
 
     def forward(self, view_embeddings):
-        # view_embeddings: dict {view_name: [N, D]}
         scores = []
         embeds = []
         for v in self.view_names:
@@ -114,11 +108,50 @@ class ViewFusionGate(nn.Module):
         fused = torch.sum(alpha.unsqueeze(-1) * stacked, dim=1)
         return fused, alpha
 
+class FeatureGate(nn.Module):
+
+    def __init__(self, total_dim, base_dim=3, hidden_dim=32, dropout=0.1):
+        super().__init__()
+        assert total_dim >= base_dim
+        self.total_dim = total_dim
+        self.base_dim = base_dim
+        self.aux_dim = total_dim - base_dim
+
+        if self.aux_dim > 0:
+            self.aux_gate = nn.Sequential(
+                nn.Linear(total_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, self.aux_dim),
+                nn.Sigmoid()
+            )
+        else:
+            self.aux_gate = None
+
+    def forward(self, x):
+        """
+        x: [N, F]
+        return:
+            x_gated: [N, F]
+            feat_gate: [N, aux_dim] or None
+        """
+        if self.aux_dim == 0:
+            return x, None
+
+        x_base = x[:, :self.base_dim]
+        x_aux = x[:, self.base_dim:]
+
+        gate = self.aux_gate(x)     # [N, aux_dim], 0~1
+        x_aux_gated = x_aux * gate
+
+        x_gated = torch.cat([x_base, x_aux_gated], dim=1)
+        return x_gated, gate
+    
+
+
 
 class PrototypeHead(nn.Module):
-    """
-    用距离粗中心最近的 top-k 样本计算原型
-    """
+
     def __init__(self, embed_dim, hidden_dim=128, proto_alpha=0.25, proto_topk_ratio=0.6, min_proto_k=8):
         super().__init__()
         self.proto_alpha = proto_alpha
@@ -179,7 +212,6 @@ class PrototypeHead(nn.Module):
             'p_neg': p_neg
         }
 
-
 class DriverGeneFewShotModel(nn.Module):
     def __init__(
         self,
@@ -192,10 +224,18 @@ class DriverGeneFewShotModel(nn.Module):
         view_names=('ppi', 'path', 'go'),
         proto_alpha=0.25,
         proto_topk_ratio=0.6,
-        min_proto_k=8
+        min_proto_k=8,
+        base_feature_dim=3,
+        feature_gate_hidden_dim=32
     ):
         super().__init__()
         self.view_names = list(view_names)
+        self.feature_gate = FeatureGate(
+            total_dim=in_dim,
+            base_dim=base_feature_dim,
+            hidden_dim=feature_gate_hidden_dim,
+            dropout=dropout
+        )
 
         self.input_proj = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
@@ -260,7 +300,9 @@ class DriverGeneFewShotModel(nn.Module):
         return z, z_spec, z_cons
 
     def forward(self, x, pos_feat, edge_index_dict, edge_weight_dict, pos_idx, neg_idx):
-        x0 = self.input_proj(x)
+        x_gated, feat_gate = self.feature_gate(x)
+        x0 = self.input_proj(x_gated)
+        # x0=x_gated
 
         view_embeddings = {}
         spec_embeddings = {}
@@ -277,12 +319,14 @@ class DriverGeneFewShotModel(nn.Module):
         fused_z, gate_weights = self.fusion_gate(view_embeddings)
         fused_z = self.fusion_proj(fused_z)
 
+
         proto_out = self.proto_head(fused_z, pos_idx=pos_idx, neg_idx=neg_idx)
 
         out = {
             'embedding': fused_z,
             'prob': torch.sigmoid(proto_out['logits']),
             'gate_weights': gate_weights,
+            'feature_gate': feat_gate,
             'view_embeddings': view_embeddings,
             'spec_embeddings': spec_embeddings,
             'cons_embeddings': cons_embeddings,
@@ -297,3 +341,6 @@ class DriverGeneFewShotModel(nn.Module):
     def classify_embeddings(self, z, p_pos, p_neg):
         logits, logits_mlp, proto_logit = self.proto_head.classify_with_prototypes(z, p_pos, p_neg)
         return logits, logits_mlp, proto_logit
+
+
+

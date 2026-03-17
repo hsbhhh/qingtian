@@ -83,6 +83,18 @@ def stratified_kfold_split(pos_label, neg_label, total_nodes, n_splits=5, seed=1
         ))
     return folds
 
+# def build_edge_weight_dict(edge_indices_with_score, device):
+#     edge_index_dict = {}
+#     edge_weight_dict = {}
+
+#     for key, (row, col, score) in edge_indices_with_score.items():
+#         edge_index = torch.stack([row, col], dim=0).long().to(device)
+#         edge_weight = score.float().to(device)
+
+#         edge_index_dict[key] = edge_index
+#         edge_weight_dict[key] = edge_weight
+
+#     return edge_index_dict, edge_weight_dict
 
 def build_edge_weight_dict(edge_indices_with_score, device):
     edge_index_dict = {}

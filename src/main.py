@@ -1,6 +1,7 @@
 # main.py
 import os
-import argparse
+# import argparse
+from parsersed import args
 import numpy as np
 import pandas as pd
 import torch
@@ -29,13 +30,16 @@ from utils import (
 
 
 def prepare_feature_matrix(data_x_df, cancer_type, device):
-    scaler = StandardScaler()
-    features_scaled = scaler.fit_transform(data_x_df.values)
-    data_x = torch.tensor(features_scaled, dtype=torch.float32, device=device)
-
+    data_x_df = data_x_df.copy()
+    data_x_df.index = data_x_df.index.astype(str).str.strip().str.upper()
     cancer_type = cancer_type.lower()
+
     if cancer_type == 'pan-cancer':
-        data_x = data_x[:, :48]
+        base_df = data_x_df.iloc[:, :48].copy()
+        base_scaler = StandardScaler()
+        base_scaled = base_scaler.fit_transform(base_df.values)
+        final_df = pd.DataFrame(base_scaled, index=base_df.index, columns=base_df.columns)
+
     else:
         cancerType_dict = {
             'kirc': [0, 16, 32],
@@ -54,11 +58,71 @@ def prepare_feature_matrix(data_x_df, cancer_type, device):
             'cesc': [14, 30, 46],
             'kirp': [15, 31, 47]
         }
+
         if cancer_type not in cancerType_dict:
             raise ValueError(f"Unsupported cancer type: {cancer_type}")
-        data_x = data_x[:, cancerType_dict[cancer_type]]
 
+        base_df = data_x_df.iloc[:, cancerType_dict[cancer_type]].copy()
+        base_scaler = StandardScaler()
+        base_scaled = base_scaler.fit_transform(base_df.values)
+        final_df = pd.DataFrame(base_scaled, index=base_df.index, columns=base_df.columns)
+
+        if cancer_type == 'luad':
+            dataPath = "./Data"
+
+            gene_methy_path = dataPath + "/LUAD_methylation_features.csv"
+            methy_file = pd.read_csv(gene_methy_path)
+            methy_file.columns = ['gene', 'avg']
+            methy_file['gene'] = methy_file['gene'].astype(str).str.strip().str.upper()
+            methy_file = methy_file.drop_duplicates(subset=['gene']).set_index('gene')
+            methy_file.columns = ['methy_avg']
+
+            gene_crispr_path = dataPath + "/LUAD_crispr_avg_features.csv"
+            crispr_file = pd.read_csv(gene_crispr_path)
+            crispr_file.columns = ['gene', 'avg']
+            crispr_file['gene'] = crispr_file['gene'].astype(str).str.strip().str.upper()
+            crispr_file = crispr_file.drop_duplicates(subset=['gene']).set_index('gene')
+            crispr_file.columns = ['crispr_avg']
+
+            hic_feat_path = dataPath + "/my_gene_hic_5d_features.csv"
+            hic_file = pd.read_csv(hic_feat_path)
+            hic_file['gene'] = hic_file['gene'].astype(str).str.strip().str.upper()
+            hic_file = hic_file.drop_duplicates(subset=['gene']).set_index('gene')
+            hic_file.columns = ['hic_1', 'hic_2', 'hic_3', 'hic_4', 'hic_5']
+
+            methy_df = methy_file.reindex(final_df.index)
+            crispr_df = crispr_file.reindex(final_df.index)
+            hic_df = hic_file.reindex(final_df.index)
+            if 'methy_avg' in methy_df.columns:
+                methy_df['methy_avg'] = methy_df['methy_avg'].fillna(methy_df['methy_avg'].median())
+
+            if 'crispr_avg' in crispr_df.columns:
+                crispr_df['crispr_avg'] = crispr_df['crispr_avg'].fillna(crispr_df['crispr_avg'].median())
+
+            hic_cols = ['hic_1', 'hic_2', 'hic_3', 'hic_4', 'hic_5']
+            for col in hic_cols:
+                if col in hic_df.columns:
+                    hic_df[col] = hic_df[col].fillna(hic_df[col].median())
+            if 'crispr_avg' in crispr_df.columns:
+                crispr_scaler = StandardScaler()
+                crispr_df[['crispr_avg']] = crispr_scaler.fit_transform(crispr_df[['crispr_avg']].values)
+
+            final_df = pd.concat(
+                [
+                    final_df,
+                    methy_df,
+                    crispr_df,
+                    hic_df
+                ],
+                axis=1
+            )
+
+    print(f"[prepare_feature_matrix] cancer={cancer_type}, final shape={final_df.shape}")
+    print(f"[prepare_feature_matrix] columns={list(final_df.columns)}")
+
+    data_x = torch.tensor(final_df.values, dtype=torch.float32, device=device)
     return data_x
+
 
 
 def get_default_hparams(cancer_type):
@@ -78,8 +142,8 @@ def get_default_hparams(cancer_type):
             'epochs': 150,
             'num_layers': 2,
             'dropout': 0.2,
-            'hidden_dim': 64,
-            'embed_dim': 128,
+            'hidden_dim': 128,
+            'embed_dim': 256,
         }
 
 
@@ -94,7 +158,9 @@ def build_model(args, in_dim, pos_dim, view_names):
         view_names=view_names,
         proto_alpha=args.proto_alpha,
         proto_topk_ratio=args.proto_topk_ratio,
-        min_proto_k=args.min_proto_k
+        min_proto_k=args.min_proto_k,
+        base_feature_dim=args.base_feature_dim,
+        feature_gate_hidden_dim=args.feature_gate_hidden_dim
     )
 
 
@@ -116,7 +182,6 @@ def evaluate_split(model, x, pos_feat, edge_index_dict, edge_weight_dict, y, eva
     y_score = prob[eval_idx].detach().cpu().numpy()
     metrics = compute_metrics(y_true, y_score, threshold=0.5, dynamic_f1=True)
     return metrics, prob.detach()
-
 
 def train_one_fold(
     fold_id,
@@ -141,21 +206,20 @@ def train_one_fold(
     align_max_nodes=256,
     device='cpu'
 ):
-    early_stopper = EarlyStopping(patience=patience, mode='max')
-
     train_idx_all = torch.where(train_mask)[0].cpu().numpy().tolist()
     train_pos_idx = [i for i in train_idx_all if y[i].item() == 1]
     train_neg_idx = [i for i in train_idx_all if y[i].item() == 0]
 
     prev_hard_pos_weight = torch.ones(y.size(0), dtype=torch.float32, device=device)
 
+    best_val_aupr = -1.0
     best_epoch = 0
+    best_state = None
+    wait = 0
 
     for epoch in range(1, epochs + 1):
         model.train()
         optimizer.zero_grad()
-
-        # warm forward for hard negative mining
         with torch.no_grad():
             warm_out = model(
                 x=x,
@@ -188,7 +252,10 @@ def train_one_fold(
             neg_idx=train_neg_idx
         )
 
-        # positive mixup on embedding space
+        feat_gate_mean = None
+        if output.get('feature_gate', None) is not None:
+            feat_gate_mean = output['feature_gate'].mean(dim=0).detach().cpu().numpy()
+
         mixed_z = generate_positive_mixup_embeddings(
             embeddings=output['embedding'],
             pos_idx=train_pos_idx,
@@ -231,16 +298,28 @@ def train_one_fold(
         train_metrics = compute_metrics(train_y_true, train_y_score, threshold=0.5, dynamic_f1=True)
 
         val_metrics, _ = evaluate_split(
-            model, x, pos_feat, edge_index_dict, edge_weight_dict, y, val_mask, train_pos_idx, train_neg_idx
+            model=model,
+            x=x,
+            pos_feat=pos_feat,
+            edge_index_dict=edge_index_dict,
+            edge_weight_dict=edge_weight_dict,
+            y=y,
+            eval_mask=val_mask,
+            train_pos_idx=train_pos_idx,
+            train_neg_idx=train_neg_idx
         )
 
-        val_key = val_metrics['AUPR']
-        if np.isnan(val_key):
-            val_key = val_metrics['AUC'] if not np.isnan(val_metrics['AUC']) else -1.0
+        current_val_aupr = val_metrics['AUPR']
+        if np.isnan(current_val_aupr):
+            current_val_aupr = -1.0
 
-        improved = early_stopper.step(val_key, model)
-        if improved:
+        if current_val_aupr > best_val_aupr:
+            best_val_aupr = current_val_aupr
             best_epoch = epoch
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            wait = 0
+        else:
+            wait += 1
 
         if epoch == 1 or epoch % 10 == 0:
             print(
@@ -257,75 +336,60 @@ def train_one_fold(
                 f"ValAUC={val_metrics['AUC']:.4f} "
                 f"ValAUPR={val_metrics['AUPR']:.4f}"
             )
+            if feat_gate_mean is not None :
+                print(f"[Fold {fold_id}][Epoch {epoch}] FeatureGateMean={np.round(feat_gate_mean, 3)}")
 
-        if early_stopper.should_stop:
-            print(f"[Fold {fold_id}] Early stopping at epoch {epoch}. Best epoch = {best_epoch}")
-            break
+        # if wait >= patience:
+        #     print(f"[Fold {fold_id}] Early stopping at epoch {epoch}. Best epoch = {best_epoch}, Best ValAUPR = {best_val_aupr:.4f}")
+        #     break
 
-    early_stopper.restore(model, device=device)
+    if best_state is not None:
+        model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
 
     train_metrics, _ = evaluate_split(
-        model, x, pos_feat, edge_index_dict, edge_weight_dict, y, train_mask, train_pos_idx, train_neg_idx
+        model=model,
+        x=x,
+        pos_feat=pos_feat,
+        edge_index_dict=edge_index_dict,
+        edge_weight_dict=edge_weight_dict,
+        y=y,
+        eval_mask=train_mask,
+        train_pos_idx=train_pos_idx,
+        train_neg_idx=train_neg_idx
     )
     val_metrics, _ = evaluate_split(
-        model, x, pos_feat, edge_index_dict, edge_weight_dict, y, val_mask, train_pos_idx, train_neg_idx
+        model=model,
+        x=x,
+        pos_feat=pos_feat,
+        edge_index_dict=edge_index_dict,
+        edge_weight_dict=edge_weight_dict,
+        y=y,
+        eval_mask=val_mask,
+        train_pos_idx=train_pos_idx,
+        train_neg_idx=train_neg_idx
     )
     test_metrics, _ = evaluate_split(
-        model, x, pos_feat, edge_index_dict, edge_weight_dict, y, test_mask, train_pos_idx, train_neg_idx
+        model=model,
+        x=x,
+        pos_feat=pos_feat,
+        edge_index_dict=edge_index_dict,
+        edge_weight_dict=edge_weight_dict,
+        y=y,
+        eval_mask=test_mask,
+        train_pos_idx=train_pos_idx,
+        train_neg_idx=train_neg_idx
     )
 
     return {
         'train_metrics': train_metrics,
         'val_metrics': val_metrics,
         'test_metrics': test_metrics,
-        'best_epoch': best_epoch
+        'best_epoch': best_epoch,
+        'best_val_aupr': best_val_aupr
     }
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', type=str, default='STRING')
-    parser.add_argument('--cancerType', type=str, default='luad')
-    parser.add_argument('--embed_dim', type=int, default=128)
-    parser.add_argument('--hidden_dim', type=int, default=64)
-    parser.add_argument('--seed', type=int, default=1234)
-    parser.add_argument('--device', type=int, default=0)
-
-    parser.add_argument('--num_layers', type=int, default=None)
-    parser.add_argument('--dropout', type=float, default=None)
-    parser.add_argument('--lr', type=float, default=None)
-    parser.add_argument('--epochs', type=int, default=None)
-    parser.add_argument('--n_splits', type=int, default=5)
-    parser.add_argument('--patience', type=int, default=30)
-
-    parser.add_argument('--use_diffusion_view', action='store_true')
-    parser.add_argument('--diff_alpha', type=float, default=0.15)
-    parser.add_argument('--diff_topk', type=int, default=50)
-
-    parser.add_argument('--proto_alpha', type=float, default=0.25)
-    parser.add_argument('--proto_topk_ratio', type=float, default=0.6)
-    parser.add_argument('--min_proto_k', type=int, default=8)
-
-    parser.add_argument('--cls_pos_weight', type=float, default=8.0)
-    parser.add_argument('--lambda_cls', type=float, default=1.0)
-    parser.add_argument('--lambda_proto', type=float, default=0.3)
-    parser.add_argument('--lambda_hard_neg', type=float, default=0.4)
-    parser.add_argument('--lambda_align', type=float, default=0.15)
-    parser.add_argument('--lambda_mixup', type=float, default=0.15)
-
-    parser.add_argument('--proto_margin', type=float, default=1.0)
-    parser.add_argument('--hard_neg_margin', type=float, default=0.5)
-    parser.add_argument('--hard_neg_topk', type=int, default=64)
-
-    parser.add_argument('--mixup_num', type=int, default=32)
-    parser.add_argument('--mixup_alpha', type=float, default=0.4)
-
-    parser.add_argument('--hard_pos_threshold', type=float, default=0.7)
-    parser.add_argument('--hard_pos_extra_weight', type=float, default=1.5)
-
-    parser.add_argument('--align_max_nodes', type=int, default=256)
-
-    args = parser.parse_args()
 
     device = torch.device(f'cuda:{args.device}' if torch.cuda.is_available() else 'cpu')
     set_seed(args.seed)
@@ -347,7 +411,6 @@ def main():
         f"Dropout={args.dropout}, Hidden={args.hidden_dim}, Embed={args.embed_dim}"
     )
 
-    # data input
     dataPath = "./Data"
 
     data_x_df = pd.read_csv(
@@ -355,6 +418,8 @@ def main():
         sep='\t', index_col=0
     )
     data_x_df = data_x_df.dropna()
+    data_x_df.index = data_x_df.index.astype(str).str.strip().str.upper()
+
 
     node_features = prepare_feature_matrix(data_x_df, args.cancerType, device)
 
@@ -364,7 +429,6 @@ def main():
 
     Y, label_pos, label_neg = load_label_single(dataPath + "/", args.cancerType.lower(), device)
 
-    # 结构位置编码特征
     pos_feat = compute_graph_structural_features(ppiAdj, label_pos).to(device)
 
     ppi_row, ppi_col, ppi_score = extract_edge_data_with_score(ppiAdj)
@@ -410,6 +474,7 @@ def main():
 
     for fold_id, (train_idx, val_idx, test_idx, train_mask, val_mask, test_mask) in enumerate(folds, start=1):
         print(f"\n--------- Fold {fold_id} Begin ---------")
+        
 
         train_mask = train_mask.to(device)
         val_mask = val_mask.to(device)
@@ -463,10 +528,14 @@ def main():
         val_metrics = fold_result['val_metrics']
         test_metrics = fold_result['test_metrics']
 
+        best_epoch = fold_result['best_epoch']
+        best_val_aupr = fold_result['best_val_aupr']
+
         all_train_metrics.append(train_metrics)
         all_val_metrics.append(val_metrics)
         all_test_metrics.append(test_metrics)
 
+        print(f"[Fold {fold_id}] BestEpoch={best_epoch} BestValAUPR={best_val_aupr:.4f}")
         print(f"[Fold {fold_id} Train] {format_metric_dict(train_metrics)}")
         print(f"[Fold {fold_id} Val]   {format_metric_dict(val_metrics)}")
         print(f"[Fold {fold_id} Test]  {format_metric_dict(test_metrics)}")
