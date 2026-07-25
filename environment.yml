@@ -1,0 +1,16 @@
+name: dyrcod
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - pip
+  - numpy
+  - pandas
+  - scipy
+  - scikit-learn
+  - pyyaml
+  - pytorch
+  - pip:
+      - -r requirements.txt
