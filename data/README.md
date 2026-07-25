@@ -20,7 +20,7 @@ data/processed/labels/
 - `CNV/`: cancer-specific copy-number variation features.
 - `Expression/`: cancer-specific expression features.
 - `CRISPR/`: cancer-specific CRISPR dependency features.
-- `Spatial/`: spatial or chromatin-derived gene features.
+- `Spatial/`: spatial or chromatin-derived gene features. Current inputs exclude `chr_id` and keep `relative_pos`, `arm_id`, `dist_centromere_norm`, and `local_gene_density_1mb`.
 
 ## Networks
 

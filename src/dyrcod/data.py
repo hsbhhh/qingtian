@@ -17,6 +17,14 @@ from sklearn.preprocessing import StandardScaler
 from .config import resolve_path
 
 
+POS_CONTEXT_FEATURE_NAMES = (
+    "pagerank",
+    "degree",
+    "mean_distance_to_positive",
+    "shortest_distance_to_positive",
+)
+
+
 @dataclass
 class DyRCoDData:
     cancer: str
@@ -94,9 +102,11 @@ def prepare_feature_matrix(
     crispr_df = crispr_df.reindex(final_df.index)
 
     spatial_df = pd.read_csv(spatial_path)
+    if "chr_id" in spatial_df.columns:
+        spatial_df = spatial_df.drop(columns=["chr_id"])
     spatial_df["gene"] = spatial_df["gene"].astype(str).str.strip().str.upper()
     spatial_df = spatial_df.drop_duplicates(subset=["gene"]).set_index("gene")
-    spatial_df.columns = [f"spatial_{idx}" for idx in range(1, len(spatial_df.columns) + 1)]
+    spatial_df.columns = [f"spatial_{column}" for column in spatial_df.columns]
     spatial_df = spatial_df.reindex(final_df.index)
 
     final_df = pd.concat([final_df, crispr_df, spatial_df], axis=1)
@@ -268,7 +278,7 @@ def _single_graph_structural_features(adj_tensor: Any, pos_idx: list[int]) -> np
 
     degree = np.array(graph.sum(axis=1)).flatten().astype(np.float32)
     degree = np.log1p(degree)
-    degree = ((degree - degree.mean()) / (degree.std() + 1e-8)).reshape(-1, 1)
+    degree = (degree - degree.mean()) / (degree.std() + 1e-8)
 
     transition = normalize_adj_scipy(graph.astype(np.float32))
     pagerank = np.ones(n_nodes, dtype=np.float32) / n_nodes
@@ -276,7 +286,7 @@ def _single_graph_structural_features(adj_tensor: Any, pos_idx: list[int]) -> np
     beta = 0.85
     for _ in range(50):
         pagerank = beta * (transition.T @ pagerank) + (1 - beta) * teleport
-    pagerank = ((pagerank - pagerank.mean()) / (pagerank.std() + 1e-8)).reshape(-1, 1)
+    pagerank = (pagerank - pagerank.mean()) / (pagerank.std() + 1e-8)
 
     pos_idx = list(map(int, np.atleast_1d(pos_idx).tolist()))
     inf = 10**9
@@ -320,20 +330,13 @@ def _single_graph_structural_features(adj_tensor: Any, pos_idx: list[int]) -> np
         mean_dist = np.ones(n_nodes, dtype=np.float32) * (max_reach + 1)
     mean_dist = mean_dist / (mean_dist.max() + 1e-8)
 
-    feats = np.concatenate([degree, pagerank, min_dist.reshape(-1, 1), mean_dist.reshape(-1, 1)], axis=1)
-    return feats.astype(np.float32)
-
-
-def _single_graph_node_context_features(adj_tensor: Any) -> np.ndarray:
-    adj = sparse_tensor_to_scipy(adj_tensor).astype(np.float32).tocsr()
-    if adj.shape[0] == 0:
-        return np.zeros((0, 3), dtype=np.float32)
-
-    degree = np.diff(adj.indptr).astype(np.float32)
-    strength = np.array(adj.sum(axis=1)).flatten().astype(np.float32)
-    mean_weight = np.nan_to_num(strength / (degree + 1e-6), nan=0.0, posinf=0.0, neginf=0.0)
-    feats = np.stack([np.log1p(degree), np.log1p(np.maximum(strength, 0.0)), mean_weight], axis=1)
-    feats = (feats - feats.mean(axis=0, keepdims=True)) / (feats.std(axis=0, keepdims=True) + 1e-8)
+    feature_values = {
+        "pagerank": pagerank,
+        "degree": degree,
+        "mean_distance_to_positive": mean_dist,
+        "shortest_distance_to_positive": min_dist,
+    }
+    feats = np.stack([feature_values[name] for name in POS_CONTEXT_FEATURE_NAMES], axis=1)
     return feats.astype(np.float32)
 
 
@@ -343,14 +346,6 @@ def compute_multiview_structural_features(
     view_names: list[str],
 ) -> torch.Tensor:
     ordered = [_single_graph_structural_features(adj_dict[view], pos_idx) for view in view_names if view in adj_dict]
-    return torch.tensor(np.concatenate(ordered, axis=1), dtype=torch.float32)
-
-
-def compute_multiview_node_context_features(
-    adj_dict: Mapping[str, Any],
-    view_names: list[str],
-) -> torch.Tensor:
-    ordered = [_single_graph_node_context_features(adj_dict[view]) for view in view_names if view in adj_dict]
     return torch.tensor(np.concatenate(ordered, axis=1), dtype=torch.float32)
 
 
@@ -365,13 +360,7 @@ def build_pos_feat(
     view_names: list[str],
     device: torch.device,
 ) -> torch.Tensor:
-    pos_feat = torch.cat(
-        [
-            compute_multiview_structural_features(adj_cpu_dict, train_pos_idx, view_names),
-            compute_multiview_node_context_features(adj_cpu_dict, view_names),
-        ],
-        dim=1,
-    )
+    pos_feat = compute_multiview_structural_features(adj_cpu_dict, train_pos_idx, view_names)
     return pos_feat.to(device=device, dtype=torch.float32)
 
 
